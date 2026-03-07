@@ -36,7 +36,7 @@ A process created from ring-0 has no inherited environment. The driver solves th
 
 1. `ZwQuerySystemInformation(SystemProcessInformation)` snapshots the full process list into a non-paged pool buffer.
 2. The snapshot is walked entry by entry, comparing `ImageName` against `L"csrss.exe"` (case-insensitive) and checking `SessionId == 1`.  `csrss.exe` is chosen because it is guaranteed to exist in every interactive session and maintains a complete, stable environment block with `PATH`, `SystemRoot`, locale, and user profile variables — unlike most user processes, it never terminates and its environment is never modified.
-3. Once the target PID is found, the driver opens it with `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION` via `ObOpenObjectByPointer`, reads `PEB → ProcessParameters → Environment` through a chain of `NtReadVirtualMemory` calls.
+3. Once the target PID is found, the driver opens it with `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION` via `ObOpenObjectByPointer`, reads `PEB -> ProcessParameters -> Environment` through a chain of `NtReadVirtualMemory` calls.
 4. Because the environment size is unknown, the driver scans the remote memory in 4 KB chunks looking for the double-null terminator (`L"\0\0"`) that marks the end of the block (up to 256 KB limit).
 5. Once the size is determined, the entire block is copied into a paged kernel pool allocation and passed to `MyRtlCreateProcessParametersEx`, which embeds it into the `RTL_USER_PROCESS_PARAMETERS` layout expected by `NtCreateUserProcess`.
 
@@ -74,7 +74,7 @@ Full resolution log:
 | `NtReadVirtualMemory` | `0x3F` | `FFFFF805A17B15E0` |
 
 - Environment copied from `csrss.exe` (PID 760, session 1), 1362 bytes
-- `NtCreateUserProcess` → `State=6` (`PsCreateSuccess`)
+- `NtCreateUserProcess` -> `State=6` (`PsCreateSuccess`)
 - Entry point resolved: `00007FF7E18A7C70` (RVA `0x27C70`)
 - PEB patched: `BeingDebugged = 0`, `NtGlobalFlag = 0`
 - Process marked as CRITICAL (`BreakOnTermination = 1`)
@@ -151,7 +151,7 @@ Loaded module list — minimal set of DLLs loaded by the Windows PE loader durin
 
 1. Open `ring0exec.sln`
 2. Select **Release / x64**
-3. Build → `x64\Release\ring0exec.sys`
+3. Build -> `x64\Release\ring0exec.sys`
 
 No external dependencies. All undocumented structures are defined locally in `ntoskrnl.h`.
 
