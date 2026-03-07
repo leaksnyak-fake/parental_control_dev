@@ -140,165 +140,231 @@ PRTL_USER_PROCESS_PARAMETERS NTAPI MyRtlNormalizeProcessParams(
 }
 
 /*
- * GetEnvironmentFromSession1
+ * GetPidFromProcessName
  *
- * Finds the first process running in session 1, reads its environment block
- * from user-mode memory into a kernel pool allocation, and returns the result
- * via OutEnv.  Intended to obtain a usable environment block for a process
- * being created from session 0 (kernel context), where the driver's own
- * environment is empty or unsuitable.
+ * Enumerates running processes via ZwQuerySystemInformation and returns
+ * the PID of the first process whose image name matches processName
+ * (case-insensitive).
  *
- * The function iterates over PIDs in steps of 4 starting at 8, skipping PID
- * 4 (System) and any process not in session 1.  It opens each candidate with
- * PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, reads PEB -> ProcessParameters
- * -> Environment, and determines the block size by scanning for the double-
- * null terminator in 4 KB chunks.
- *
- * The caller must free OutEnv->Buffer with ExFreePoolWithTag(..., ENV_POOL_TAG)
- * when it is no longer needed.
+ * Allocates a non-paged buffer for the process snapshot, walks every
+ * SYSTEM_PROCESS_INFORMATION entry comparing ImageName, and frees the
+ * buffer before returning.
  *
  * Parameters:
- *   OutEnv - receives a pointer to the kernel-mode copy of the environment
- *            block and its byte size; zeroed on failure
+ *   processName - UNICODE_STRING to match against each process image name
  *
  * Returns:
- *   STATUS_SUCCESS if an environment block was successfully captured.
- *   STATUS_NOT_FOUND if no suitable session-1 process was found.
+ *   HANDLE to the matching process ID, or NULL if not found / on failure.
+ */
+HANDLE GetPidFromProcessName(const UNICODE_STRING processName) {
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG bufferSize = 0;
+    PVOID buffer = NULL;
+
+    PSYSTEM_PROCESS_INFORMATION pCurrent = NULL;
+
+    status = ZwQuerySystemInformation(SystemProcessInformation, buffer, bufferSize, &bufferSize);
+    if (status == STATUS_INFO_LENGTH_MISMATCH)
+    {
+        buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, bufferSize, ENV_POOL_TAG);
+        if (buffer == NULL)
+        {
+            return pCurrent;
+        }
+        else
+        {
+            status = ZwQuerySystemInformation(SystemProcessInformation, buffer, bufferSize, &bufferSize);
+            if (!NT_SUCCESS(status))
+            {
+                ExFreePoolWithTag(buffer, ENV_POOL_TAG);
+                return pCurrent;
+            }
+        }
+    }
+
+    pCurrent = (PSYSTEM_PROCESS_INFORMATION)buffer;
+    while (pCurrent)
+    {
+        if (pCurrent->ImageName.Buffer != NULL)
+        {
+            if (RtlCompareUnicodeString(&(pCurrent->ImageName), &processName, TRUE) == 0)
+            {
+                ExFreePoolWithTag(buffer, ENV_POOL_TAG);
+                return pCurrent->ProcessId;
+            }
+        }
+        if (pCurrent->NextEntryOffset == 0) {
+            pCurrent = NULL;
+        }
+        else
+        {
+            pCurrent = (PSYSTEM_PROCESS_INFORMATION)(((PUCHAR)pCurrent) + pCurrent->NextEntryOffset);
+        }
+    }
+    return pCurrent;
+}
+
+/*
+ * GetEnvironmentFromSession1
+ *
+ * Locates csrss.exe running in session 1 via ZwQuerySystemInformation,
+ * opens the process, reads PEB -> ProcessParameters -> Environment from
+ * user-mode memory, and copies the entire environment block into a paged
+ * kernel pool allocation returned through OutEnv.
+ *
+ * csrss.exe is chosen as the donor because it is guaranteed to exist in
+ * every interactive session and maintains a complete, stable environment
+ * block.  The session ID is checked directly from the SYSTEM_PROCESS_-
+ * INFORMATION snapshot, so no separate PsGetProcessSessionId call is
+ * needed.
+ *
+ * The environment size is determined by scanning 4 KB chunks for the
+ * double-null terminator (up to 256 KB).  On success the caller must
+ * free OutEnv->Buffer with ExFreePoolWithTag(..., ENV_POOL_TAG).
+ *
+ * Parameters:
+ *   OutEnv - receives a pointer to the kernel-mode copy of the
+ *            environment block and its byte size; zeroed on failure
+ *
+ * Returns:
+ *   STATUS_SUCCESS if the environment block was captured.
+ *   STATUS_NOT_FOUND if no session-1 csrss.exe was found.
  *   STATUS_INSUFFICIENT_RESOURCES on pool allocation failure.
- *   Other propagated NTSTATUS values from NtQueryInformationProcess or
- *   NtReadVirtualMemory on the last attempted process.
+ *   Other propagated NTSTATUS values from ZwQuerySystemInformation,
+ *   NtQueryInformationProcess, or NtReadVirtualMemory.
  */
 NTSTATUS
 GetEnvironmentFromSession1(
     _Out_ PENV_BLOCK OutEnv
 )
 {
-    NTSTATUS   status = STATUS_NOT_FOUND;
-    PEPROCESS  process = NULL;
-    HANDLE     hProcess = NULL;
+    NTSTATUS  status = STATUS_NOT_FOUND;
+    HANDLE    hProcess = NULL;
 
     OutEnv->Buffer = NULL;
     OutEnv->Size = 0;
 
-    for (ULONG pid = 8; pid < 0x10000; pid += 4)
+    /* ---------- find csrss.exe in session 1 ---------- */
+    UNICODE_STRING csrssName;
+    RtlInitUnicodeString(&csrssName, L"csrss.exe");
+    HANDLE csrssPid = GetPidFromProcessName(csrssName);
+   
+
+    if (!csrssPid)
+        return STATUS_NOT_FOUND;
+
+    PEPROCESS process = NULL;
+    status = PsLookupProcessByProcessId(csrssPid, &process);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    status = ObOpenObjectByPointer(
+        process,
+        OBJ_KERNEL_HANDLE,
+        NULL,
+        PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+        *PsProcessType,
+        KernelMode,
+        &hProcess
+    );
+    if (!NT_SUCCESS(status))
     {
-        status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
-        if (!NT_SUCCESS(status)) continue;
-
-        if (PsGetProcessSessionId(process) != 1 || pid <= 4)
-        {
-            ObDereferenceObject(process);
-            continue;
-        }
-
-        status = ObOpenObjectByPointer(
-            process,
-            OBJ_KERNEL_HANDLE,
-            NULL,
-            PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
-            *PsProcessType,
-            KernelMode,
-            &hProcess
-        );
-
-        if (!NT_SUCCESS(status))
-        {
-            ObDereferenceObject(process);
-            continue;
-        }
-
-        PROCESS_BASIC_INFORMATION pbi = { 0 };
-        status = NtQueryInformationProcess(
-            hProcess, ProcessBasicInformation,
-            &pbi, sizeof(pbi), NULL
-        );
-        if (!NT_SUCCESS(status)) goto NextProcess;
-
-        PEB peb = { 0 };
-        SIZE_T  bytesRead = 0;
-        status = NtReadVirtualMemory(
-            hProcess, pbi.PebBaseAddress,
-            &peb, sizeof(peb), &bytesRead
-        );
-        if (!NT_SUCCESS(status) || !peb.ProcessParameters) goto NextProcess;
-
-        RTL_USER_PROCESS_PARAMETERS params = { 0 };
-        status = NtReadVirtualMemory(
-            hProcess, peb.ProcessParameters,
-            &params, sizeof(params), &bytesRead
-        );
-        if (!NT_SUCCESS(status) || !params.Environment) goto NextProcess;
-
-        SIZE_T envSize = 0;
-        {
-            PVOID  envBase = params.Environment;
-
-            if (!(params.Flags & RTL_USER_PROC_PARAMS_NORMALIZED))
-            {
-                envBase = (PVOID)((PUCHAR)peb.ProcessParameters
-                    + (ULONG_PTR)params.Environment);
-            }
-
-            const SIZE_T  CHUNK = 4096;
-            PWCHAR tmpBuf = (PWCHAR)ExAllocatePool2(POOL_FLAG_PAGED, CHUNK, ENV_POOL_TAG);
-            if (!tmpBuf) goto NextProcess;
-
-            BOOLEAN found = FALSE;
-            for (SIZE_T offset = 0; offset < 256 * 1024; offset += CHUNK)
-            {
-                SIZE_T toRead = CHUNK;
-                status = NtReadVirtualMemory(
-                    hProcess,
-                    (PUCHAR)envBase + offset,
-                    tmpBuf, toRead, &bytesRead
-                );
-                if (!NT_SUCCESS(status) || bytesRead < 2) break;
-
-                ULONG wchars = (ULONG)(bytesRead / sizeof(WCHAR));
-                for (ULONG i = 0; i + 1 < wchars; i++)
-                {
-                    if (tmpBuf[i] == L'\0' && tmpBuf[i + 1] == L'\0')
-                    {
-                        envSize = offset + (i + 2) * sizeof(WCHAR);
-                        found = TRUE;
-                        break;
-                    }
-                }
-                if (found) break;
-            }
-            ExFreePoolWithTag(tmpBuf, ENV_POOL_TAG);
-
-            if (!found || envSize == 0) goto NextProcess;
-
-            PVOID envKernel = ExAllocatePool2(POOL_FLAG_PAGED, envSize, ENV_POOL_TAG);
-            if (!envKernel) { status = STATUS_INSUFFICIENT_RESOURCES; goto NextProcess; }
-
-            status = NtReadVirtualMemory(
-                hProcess, envBase,
-                envKernel, envSize, &bytesRead
-            );
-            if (!NT_SUCCESS(status))
-            {
-                ExFreePoolWithTag(envKernel, ENV_POOL_TAG);
-                goto NextProcess;
-            }
-
-            OutEnv->Buffer = envKernel;
-            OutEnv->Size = envSize;
-
-            DbgPrint("[kproc] Env copied from PID %lu, size %zu bytes\n", pid, envSize);
-        }
-
-        ZwClose(hProcess);
         ObDereferenceObject(process);
-        return STATUS_SUCCESS;
-
-    NextProcess:
-        if (hProcess) { ZwClose(hProcess); hProcess = NULL; }
-        ObDereferenceObject(process);
+        return status;
     }
 
-    return STATUS_NOT_FOUND;
+    PROCESS_BASIC_INFORMATION pbi = { 0 };
+    status = NtQueryInformationProcess(
+        hProcess, ProcessBasicInformation,
+        &pbi, sizeof(pbi), NULL
+    );
+    if (!NT_SUCCESS(status)) goto Cleanup;
+
+    PEB peb = { 0 };
+    SIZE_T bytesRead = 0;
+    status = NtReadVirtualMemory(
+        hProcess, pbi.PebBaseAddress,
+        &peb, sizeof(peb), &bytesRead
+    );
+    if (!NT_SUCCESS(status) || !peb.ProcessParameters) goto Cleanup;
+
+    RTL_USER_PROCESS_PARAMETERS params = { 0 };
+    status = NtReadVirtualMemory(
+        hProcess, peb.ProcessParameters,
+        &params, sizeof(params), &bytesRead
+    );
+    if (!NT_SUCCESS(status) || !params.Environment) goto Cleanup;
+
+    PVOID envBase = params.Environment;
+    if (!(params.Flags & RTL_USER_PROC_PARAMS_NORMALIZED))
+    {
+        envBase = (PVOID)((PUCHAR)peb.ProcessParameters
+            + (ULONG_PTR)params.Environment);
+    }
+
+    SIZE_T envSize = 0;
+    {
+        const SIZE_T CHUNK = 4096;
+        PWCHAR tmpBuf = (PWCHAR)ExAllocatePool2(POOL_FLAG_PAGED, CHUNK, ENV_POOL_TAG);
+        if (!tmpBuf) { status = STATUS_INSUFFICIENT_RESOURCES; goto Cleanup; }
+
+        BOOLEAN found = FALSE;
+        for (SIZE_T offset = 0; offset < 256 * 1024; offset += CHUNK)
+        {
+            status = NtReadVirtualMemory(
+                hProcess,
+                (PUCHAR)envBase + offset,
+                tmpBuf, CHUNK, &bytesRead
+            );
+            if (!NT_SUCCESS(status) || bytesRead < 2) break;
+
+            ULONG wchars = (ULONG)(bytesRead / sizeof(WCHAR));
+            for (ULONG i = 0; i + 1 < wchars; i++)
+            {
+                if (tmpBuf[i] == L'\0' && tmpBuf[i + 1] == L'\0')
+                {
+                    envSize = offset + (i + 2) * sizeof(WCHAR);
+                    found = TRUE;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+        ExFreePoolWithTag(tmpBuf, ENV_POOL_TAG);
+
+        if (!found || envSize == 0)
+        {
+            status = STATUS_NOT_FOUND;
+            goto Cleanup;
+        }
+    }
+
+
+    PVOID envKernel = ExAllocatePool2(POOL_FLAG_PAGED, envSize, ENV_POOL_TAG);
+    if (!envKernel) { status = STATUS_INSUFFICIENT_RESOURCES; goto Cleanup; }
+
+    status = NtReadVirtualMemory(
+        hProcess, envBase,
+        envKernel, envSize, &bytesRead
+    );
+    if (!NT_SUCCESS(status))
+    {
+        ExFreePoolWithTag(envKernel, ENV_POOL_TAG);
+        goto Cleanup;
+    }
+
+    OutEnv->Buffer = envKernel;
+    OutEnv->Size = envSize;
+
+    DbgPrint("[kproc] Env copied from csrss.exe (PID %lu, session 1), size %zu bytes\n",
+        (ULONG)(ULONG_PTR)csrssPid, envSize);
+
+    status = STATUS_SUCCESS;
+
+Cleanup:
+    if (hProcess) ZwClose(hProcess);
+    ObDereferenceObject(process);
+    return status;
 }
 
 /*
